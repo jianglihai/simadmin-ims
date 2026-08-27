@@ -13,9 +13,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu musl-dev
           rustup target add aarch64-unknown-linux-musl
-          echo "CC_aarch64-unknown-linux-musl=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
       - name: Build
-        run: cargo build --release --target aarch64-unknown-linux-musl
+        env:
+          CC_aarch64-unknown-linux-musl: aarch64-linux-gnu-gcc
+        run: |
+          cargo build --release --target aarch64-unknown-linux-musl
       - uses: actions/upload-artifact@v4
         with:
           name: simadmin-ims
