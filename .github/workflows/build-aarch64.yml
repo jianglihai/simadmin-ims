@@ -8,8 +8,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: rustup target add aarch64-unknown-linux-musl
+      - name: Install musl cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu musl-dev libdbus-1-dev pkg-config
+          rustup target add aarch64-unknown-linux-musl
+          echo "CC_aarch64-unknown-linux-musl=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
       - name: Build
+        env:
+          RUSTFLAGS: -Ctarget-feature=-crt-static
         run: cargo build --release --target aarch64-unknown-linux-musl
       - uses: actions/upload-artifact@v4
         with:
