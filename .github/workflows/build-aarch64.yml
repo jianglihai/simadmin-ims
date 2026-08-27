@@ -8,17 +8,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install aarch64 cross toolchain
+      - name: Install musl cross toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross g++-aarch64-linux-gnu
-          rustup target add aarch64-unknown-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu musl-dev musl-tools
+          rustup target add aarch64-unknown-linux-musl
       - name: Build
         env:
-          CC_aarch64-unknown-linux-gnu: aarch64-linux-gnu-gcc
-        run: cargo build --release --target aarch64-unknown-linux-gnu
+          CC_aarch64-unknown-linux-musl: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+          RUSTFLAGS: -C linker=aarch64-linux-gnu-gcc
+        run: cargo build --release --target aarch64-unknown-linux-musl
       - uses: actions/upload-artifact@v4
         with:
           name: simadmin-ims
-          path: target/aarch64-unknown-linux-gnu/release/simadmin-ims
+          path: target/aarch64-unknown-linux-musl/release/simadmin-ims
           if-no-files-found: error
