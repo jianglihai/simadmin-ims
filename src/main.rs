@@ -1,6 +1,6 @@
 //! simadmin-ims: standalone IMS/VoLTE daemon beside SimAdmin.
 use anyhow::Result;
-use std::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::error;
 
