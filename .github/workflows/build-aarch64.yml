@@ -1,25 +1,33 @@
 name: build
 on:
   push:
-    paths: ["Cargo.toml", "src/**", ".github/workflows/**"]
+    paths: ["Cargo.toml", "src/**", "qmi-tool/**", ".github/workflows/**"]
   workflow_dispatch:
 jobs:
   build-aarch64:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install musl cross toolchain
+      - name: Install cross toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu musl-dev libdbus-1-dev pkg-config
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu musl-dev libqmi-dev pkg-config
           rustup target add aarch64-unknown-linux-musl
-          echo "CC_aarch64-unknown-linux-musl=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
-      - name: Build
-        env:
-          RUSTFLAGS: -Ctarget-feature=-crt-static
+      - name: Build Rust daemon
         run: cargo build --release --target aarch64-unknown-linux-musl
+      - name: Build qmi tool (cross)
+        run: |
+          mkdir -p out
+          aarch64-linux-gnu-gcc -static qmi-tool/ims_qmi.c -o out/ims_qmi -I/usr/include/libqmi-qt/qmi 2>/dev/null \
+            || aarch64-linux-gnu-gcc -static qmi-tool/ims_qmi.c -o out/ims_qmi
+          ls -la out/
       - uses: actions/upload-artifact@v4
         with:
           name: simadmin-ims
           path: target/aarch64-unknown-linux-musl/release/simadmin-ims
           if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ims-qmi
+          path: out/ims_qmi
+          if-no-files-found: ignore
