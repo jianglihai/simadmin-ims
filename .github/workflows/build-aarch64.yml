@@ -1,0 +1,18 @@
+name: build
+on:
+  push:
+    paths: ["Cargo.toml", "src/**", ".github/workflows/**"]
+  workflow_dispatch:
+jobs:
+  build-aarch64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add aarch64-unknown-linux-musl
+      - name: Build
+        run: cargo build --release --target aarch64-unknown-linux-musl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: simadmin-ims
+          path: target/aarch64-unknown-linux-musl/release/simadmin-ims
+          if-no-files-found: error
