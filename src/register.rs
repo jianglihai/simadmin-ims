@@ -91,7 +91,8 @@ impl SaParams {
 
 fn parse_legacy(state: &str, policy: &str, pcscf: &str, ue_ip: &str) -> Result<SaParams> {
     let esp_key_hex = state.lines().find_map(|l| {
-        l.split("hmac(md5)").nth(1).map(|t| t.split_whitespace().next()).flatten()
+        l.split("hmac(md5)").nth(1).and_then(|t| t.split_whitespace().next())
+            .and_then(|w| w.strip_prefix("0x").or(w.strip_prefix("0X")).or(Some(w)))
     }).ok_or_else(|| anyhow!("ESP auth key not found"))?;
     let esp_key = hex::decode(esp_key_hex)?;
     // 端口:policy 段 out 行 sport=ue_send,dport=pcscf_send;in 行 sport=pcscf_recv,dport=ue_recv
