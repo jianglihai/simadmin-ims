@@ -7,7 +7,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
 mod register;
-use register::{build_plain_register, build_esp, build_secure_register};
+use register::{build_esp};
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct State {
@@ -93,15 +93,23 @@ async fn reg_register(st: Arc<Mutex<State>>) {
       s.pcscf = pcscf.clone(); s.ue_ip = ue_ip.clone();
       s.imsi = usim.imsi.clone(); s.aid = usim.aid.clone();
       s.log = format!("OK discover pcscf={} local={}", pcscf, ue_ip);
-      s.registering_step = "build-esp".to_string(); }
+      s.registering_step = "init-bearer".to_string(); }
+
+    // IMS bearer: keep qmicli attached to at0 (raw-ip) so wwan1 stays UP.
+    // qmicli holds the PDP; if it exits the bearer dies (1.1.6 pattern).
+    let bearer = register::bearer_start("at0").await;
+    if !bearer {
+        log_end(&st, "FAIL bearer: wwan1 not up", "error").await; return;
+    }
+    log_end(&st, "bearer ok wwan1 UP", "init-bearer").await;
 
     let realm = "ims.mnc001.mcc460.3gppnetwork.org";
-    let sa = match register::SaParams::from_legacy(&pcscf, &ue_ip).await {
+    let sa = match register::SaParams::from_live(&pcscf, &ue_ip).await {
         Ok(x) => x, Err(e) => { log_end(&st, &format!("FAIL sa: {}", e), "error").await; return; }
     };
     log_end(&st, "sa ok", "register-1").await;
 
-    let res = do_register(&pcscf, &sa, &[]).await;
+    let res = do_register(&pcscf, &sa).await;
     let mut s = st.lock().await;
     s.registering = false;
     match res {
@@ -116,66 +124,115 @@ async fn log_end(st: &Arc<Mutex<State>>, msg: &str, step: &str) {
     s.log = msg.to_string(); s.registering_step = step.to_string();
 }
 
-async fn do_register(pcscf: &str, sa: &register::SaParams, _plain: &[u8]) -> Result<bool> {
+async fn do_register(pcscf: &str, sa: &register::SaParams) -> Result<bool> {
     let pcscf_addr: std::net::Ipv6Addr = pcscf.parse()?;
-    // 用随机 UE 端口(5064/5063 语义,先复用 xfrm 的 ue_send)
-    let u = tokio::net::UdpSocket::bind("[::]:0").await?;
-    let ue_local = u.local_addr().unwrap();
-    log::info!("ims udp bound {}", ue_local);
-
+    let ts = || std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as u64;
+    let realm = "ims.mnc001.mcc460.3gppnetwork.org";
     let ue_send = if sa.ue_send > 0 { sa.ue_send } else { 5064 };
     let ue_recv = if sa.ue_recv > 0 { sa.ue_recv } else { 5063 };
+    let mut spi_c = sa.ue_send as u32; let mut spi_s = sa.ue_recv as u32;
+    eprintln!("[ims] REGISTER ue_send={} ue_recv={} spi={}/{}", ue_send, ue_recv, spi_c, spi_s);
 
-    // 第 1 轮:明文 REGISTER → P-CSCF 5061 (TS 24.229)
-    let sip1 = build_plain_register("ue", "ims.mnc001.mcc460.3gppnetwork.org",
-        pcscf, &sa.ue_ip, ue_send, ue_recv, 0, sa.ue_send as u32, sa.ue_recv as u32);
-    log::info!("plain REGISTER {} bytes", sip1.len());
-    let mut buf = [0u8; 4096];
-    u.send_to(sip1.as_bytes(), (pcscf_addr, 5061)).await?;
-    let r1 = tokio::time::timeout(std::time::Duration::from_secs(12), u.recv_from(&mut buf)).await;
-    let (n, _from) = match r1 {
-        Ok(Ok(x)) => x,
-        _ => { log::info!("no 401 reply (timeout/err)"); return Ok(false); }
+    // 第 1 轮:TCP/5060 明文 REGISTER,只带 Supported: sec-agree(TS 24.229)
+    let t1 = ts();
+    let plain = format!(
+        "REGISTER sip:{} SIP/2.0\r\n\
+         Via: SIP/2.0/TCP [{}]:5063;branch=z9hG4bK{}\r\n\
+         From: <sip:ue@{}>;tag=ue{}\r\n\
+         To: <sip:ue@{}>\r\n\
+         Call-ID: ims-{}@{}\r\n\
+         CSeq: 1 REGISTER\r\n\
+         Contact: <sip:ue@{}:5063;transport=tcp>;ob\r\n\
+         Supported: sec-agree\r\n\
+         Max-Forwards: 70\r\n\
+         Content-Length: 0\r\n\r\n",
+        realm, sa.ue_ip, t1, realm, t1, realm, t1, sa.ue_ip, sa.ue_ip);
+    eprintln!("[ims] plain REGISTER {} bytes", plain.len());
+    let resp1 = match do_tcp(pcscf_addr, 5060, plain.as_bytes(), 12).await? {
+        Some(r) => r, None => { eprintln!("[ims] no reply to plain"); return Ok(false); }
     };
-    let sip_resp = String::from_utf8_lossy(&buf[..n]);
-    log::info!("resp {} bytes: {}", n, &sip_resp[..std::cmp::min(n, 80)]);
+    eprintln!("[ims] r1 len={} head={}", resp1.len(),
+        String::from_utf8_lossy(&resp1[..std::cmp::min(resp1.len(), 60)]));
 
-    // 第 2 轮:若 401,提取 nonce/realm/Security-Server;用 USIM AKA 算 AKAv1-MD5 → 受保护 REGISTER over ESP
-    if sip_resp.contains("401") {
-        let nonce = parse_digest_field(&sip_resp, "nonce");
-        let nonce_str = nonce.clone().unwrap_or_default();
-        let realm = parse_digest_field(&sip_resp, "realm").unwrap_or_else(|| "ims.mnc001.mcc460.3gppnetwork.org".to_string());
-        let resp = aka_md5_response(&[0;16], &[0;8], &nonce_str,
-            "00000001", "0123456789abcdef", "auth", &realm, "ue");
-        let sip2 = build_secure_register("ue", &realm, pcscf, &sa.ue_ip,
-            &nonce_str, &resp, ue_send, ue_recv,
-            sa.ue_send as u32, sa.ue_recv as u32);
-        let esp = register::build_esp(sa.ue_send as u32, 1, &sa.esp_key, sip2.as_bytes());
-        log::info!("secure REGISTER via ESP {} bytes to pcscf{}", esp.len(), pcscf);
-        u.send_to(&esp, (pcscf_addr, sa.pcscf_send)).await?;
-        let r2 = tokio::time::timeout(std::time::Duration::from_secs(12), u.recv_from(&mut buf)).await;
-        match r2 {
-            Ok(Ok((n2, _))) => {
-                let resp2 = String::from_utf8_lossy(&buf[..n2]);
-                log::info!("secure resp {} bytes: {}", n2, &resp2[..std::cmp::min(n2, 60)]);
-                Ok(resp2.contains("200 OK"))
-            }
-            _ => Ok(false),
-        }
-    } else {
-        Ok(sip_resp.contains("200 OK"))
+    if resp1.starts_with(b"SIP/2.0 200") { return Ok(true); }
+    if !resp1.starts_with(b"SIP/2.0 401") {
+        eprintln!("[ims] unexpected r1"); return Ok(false);
+    }
+    // 第 2 轮:解析 nonce + Security-Server,AKAv1-MD5 → 受保护 REGISTER
+    let nonce = extract(&resp1, "nonce").unwrap_or_default();
+    let sec_srv = extract(&resp1, "Security-Server").unwrap_or_default();
+    let nonce_str = String::from_utf8_lossy(&nonce).to_string();
+    let sec_srv_str = String::from_utf8_lossy(&sec_srv).trim().to_string();
+    eprintln!("[ims] nonce={} sec-srv={}", nonce_str,
+        sec_srv_str[..std::cmp::min(sec_srv_str.len(), 80)].to_string());
+    let resp_digest = aka_md5_response(&[0;16], &[0;8], &nonce_str, "00000001",
+        "0123456789abcdef", "auth", realm, "ue");
+    let resp_hex: String = resp_digest.iter().map(|b| format!("{:02x}", b)).collect();
+    let t2 = ts();
+    let esp_key = sa.esp_key.clone();
+    let protected = format!(
+        "REGISTER sip:{} SIP/2.0\r\n\
+         Via: SIP/2.0/TCP [{}]:5063;branch=z9hG4bK{}\r\n\
+         From: <sip:ue@{}>;tag=ue{}\r\n\
+         To: <sip:ue@{}>\r\n\
+         Call-ID: ims-{}@{}\r\n\
+         CSeq: 2 REGISTER\r\n\
+         Contact: <sip:ue@{}:5063;transport=tcp>;ob\r\n\
+         Authorization: Digest realm=\"{}\",username=\"ue\",nonce=\"{}\",uri=\"sip:{pcscf}\",algorithm=AKAv1-MD5,response=\"{rh}\",qop=auth,cnonce=\"0123456789abcdef\",nc=00000001\r\n\
+         Security-Client: ipsec-3gpp; prot=esp; mod=trans; spi-c={spic}; spi-s={spis}; port-c={pc}; port-s=5063; alg=hmac-md5-96; ealg=null\r\n\
+         Security-Verify: {sv}\r\n\
+         Supported: sec-agree\r\n\
+         Max-Forwards: 70\r\n\
+         Content-Length: 0\r\n\r\n",
+        realm, sa.ue_ip, t2, realm, t2, realm, t2, sa.ue_ip, sa.ue_ip,
+        realm, nonce_str, rh = resp_hex, spic = spi_c, spis = spi_s,
+        pc = ue_send, sv = sec_srv_str);
+    eprintln!("[ims] protected REGISTER {} bytes", protected.len());
+    let esp = register::build_esp(spi_c, 1, &esp_key, protected.as_bytes());
+    let r2 = do_tcp(pcscf_addr, sa.pcscf_send.max(5060), &esp, 12).await?;
+    match r2 {
+        Some(r) => { eprintln!("[ims] r2 len={} head={}", r.len(),
+            String::from_utf8_lossy(&r[..std::cmp::min(r.len(), 60)]));
+            Ok(r.starts_with(b"SIP/2.0 200")) }
+        None => Ok(false),
     }
 }
 
-fn parse_digest_field(s: &str, key: &str) -> Option<String> {
-    for part in s.split(|c| c == ';' || c == '\r' || c == '\n') {
-        let p = part.trim();
-        if p.contains('=') && p.starts_with(key) {
-            let v = p.splitn(2, '=').nth(1)?.trim().trim_matches('"');
-            if !v.is_empty() { return Some(v.to_string()); }
+async fn do_tcp(dest: std::net::Ipv6Addr, port: u16, payload: &[u8], to: u64) -> Result<Option<Vec<u8>>> {
+    let mut c = tokio::net::TcpStream::connect((dest, port)).await?;
+    c.write_all(payload).await?;
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(to);
+    loop {
+        let left = end.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() { break; }
+        tokio::time::sleep(left).await;
+        match c.try_read(&mut buf) {
+            Ok(n) if n > 0 => {
+                out.extend_from_slice(&buf[..n]);
+                if out.ends_with(b"\r\n\r\n") { break; }
+            }
+            Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await
+            }
+            Err(e) => { eprintln!("[ims] tcp read err {}", e); return Ok(Some(out)); }
         }
+        if out.len() >= 8192 { break; }
     }
-    None
+    Ok(Some(out))
+}
+
+fn extract(body: &[u8], key: &str) -> Option<Vec<u8>> {
+    let s = String::from_utf8_lossy(body);
+    let k = format!("{}=", key);
+    s.find(&k).and_then(|i| {
+        let sub = &s[i + k.len()..];
+        let end = sub.find(|c| c == ';' || c == '\r' || c == '\n').unwrap_or(sub.len());
+        Some(sub[..end].trim_matches('"').trim().as_bytes().to_vec())
+    })
 }
 
 fn aka_md5_response(rand: &[u8], res: &[u8], nonce: &str, nc: &str,
