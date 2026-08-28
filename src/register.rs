@@ -165,7 +165,7 @@ pub fn build_esp(spi: u32, seq: u32, key: &[u8], payload: &[u8]) -> Vec<u8> {
 }
 
 pub fn build_plain_register(user: &str, realm: &str, _pcscf: &str, ue_ip: &str,
-                            ue_send: u16, _ue_recv: u16, _pcscf_send: u16,
+                            ue_send: u16, _ue_recv: u16, _pcscf_send: u32,
                             spi_c: u32, spi_s: u32) -> String {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as u64;
@@ -181,6 +181,32 @@ pub fn build_plain_register(user: &str, realm: &str, _pcscf: &str, ue_ip: &str,
          Contact: <sip:{user}@{ue_ip}:5063;transport=udp>\r\n\
          Supported: sec-agree\r\n\
          Security-Client: ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;prot=esp;mod=trans;spi-c={spi_c};spi-s={spi_s};port-c={ue_send};port-s=5063\r\n\
+         Content-Length: 0\r\n\r\n"
+    )
+}
+
+/// 受保护 REGISTER(TS 24.229):Security-Verify + Authorization + sec-agree
+pub fn build_secure_register(user: &str, realm: &str, pcscf: &str, ue_ip: &str,
+                             nonce: &str, response: &[u8], ue_send: u16, _ue_recv: u16,
+                             spi_c: u32, spi_s: u32) -> String {
+    let resp_hex: String = response.iter().map(|b| format!("{:02x}", b)).collect();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as u64;
+    format!(
+        "REGISTER sip:{realm} SIP/2.0\r\n\
+         Via: SIP/2.0/UDP {ue_ip}:5063;branch=z9hG4bK{ts}\r\n\
+         Max-Forwards: 70\r\n\
+         To: <sip:{user}@{realm}>\r\n\
+         From: <sip:{user}@{realm}>;tag=ue{ts}\r\n\
+         Call-ID: ims-{ts}@{ue_ip}\r\n\
+         CSeq: 2 REGISTER\r\n\
+         Contact: <sip:{user}@{ue_ip}:5063;transport=udp>\r\n\
+         Authorization: Digest realm=\"{realm}\",username=\"{user}\",nonce=\"{nonce}\",uri=\"sip:{pcscf}\",algorithm=AKAv1-MD5,response=\"{resp_hex}\",qop=auth,cnonce=\"0123456789abcdef\",nc=00000001\r\n\
+         Supported: sec-agree\r\n\
+         Require: sec-agree\r\n\
+         Proxy-Require: sec-agree\r\n\
+         Security-Client: ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;prot=esp;mod=trans;spi-c={spi_c};spi-s={spi_s};port-c={ue_send};port-s=5063\r\n\
+         Security-Verify: ipsec-3gpp;q=0.5;alg=hmac-sha-1-96;prot=esp;mod=trans;spi-c={spi_c};spi-s={spi_s};port-c={ue_send};port-s=5063\r\n\
          Content-Length: 0\r\n\r\n"
     )
 }
