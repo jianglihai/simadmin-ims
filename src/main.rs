@@ -99,11 +99,9 @@ async fn reg_register(st: Arc<Mutex<State>>) {
     let sa = match register::SaParams::from_legacy(&pcscf, &ue_ip).await {
         Ok(x) => x, Err(e) => { log_end(&st, &format!("FAIL sa: {}", e), "error").await; return; }
     };
-    let sip = build_plain_register(&usim.imsi, realm, &pcscf, &ue_ip,
-        sa.ue_send.max(5064), sa.ue_recv, sa.pcscf_send, sa.pcscf_recv as u32, (sa.pcscf_recv.wrapping_add(1)) as u32);
-    log_end(&st, &format!("REGISTER payload {} bytes", sip.len()), "register-1").await;
+    log_end(&st, "sa ok", "register-1").await;
 
-    let res = do_register(&pcscf, &sa, sip.as_bytes()).await;
+    let res = do_register(&pcscf, &sa, &[]).await;
     let mut s = st.lock().await;
     s.registering = false;
     match res {
@@ -121,9 +119,7 @@ async fn log_end(st: &Arc<Mutex<State>>, msg: &str, step: &str) {
 async fn do_register(pcscf: &str, sa: &register::SaParams, _plain: &[u8]) -> Result<bool> {
     let pcscf_addr: std::net::Ipv6Addr = pcscf.parse()?;
     // 用随机 UE 端口(5064/5063 语义,先复用 xfrm 的 ue_send)
-    let u = tokio::net::UdpSocket::bind("::1:0").await
-        .or_else(|_| tokio::net::UdpSocket::bind("::1:0").await).await
-        .or_else(|_| tokio::net::UdpSocket::bind("[::]:0").await).await?;
+    let u = tokio::net::UdpSocket::bind("[::]:0").await?;
     let ue_local = u.local_addr().unwrap();
     log::info!("ims udp bound {}", ue_local);
 
@@ -147,12 +143,12 @@ async fn do_register(pcscf: &str, sa: &register::SaParams, _plain: &[u8]) -> Res
     // 第 2 轮:若 401,提取 nonce/realm/Security-Server;用 USIM AKA 算 AKAv1-MD5 → 受保护 REGISTER over ESP
     if sip_resp.contains("401") {
         let nonce = parse_digest_field(&sip_resp, "nonce");
+        let nonce_str = nonce.clone().unwrap_or_default();
         let realm = parse_digest_field(&sip_resp, "realm").unwrap_or_else(|| "ims.mnc001.mcc460.3gppnetwork.org".to_string());
-        // 用占位 RES 先跑通 ESP 路径(真 AKA 需 CHALLENGE APDU,后续接)
-        let resp = aka_md5_response(&[0;16], &[0;8], &nonce.unwrap_or_default(),
+        let resp = aka_md5_response(&[0;16], &[0;8], &nonce_str,
             "00000001", "0123456789abcdef", "auth", &realm, "ue");
         let sip2 = build_secure_register("ue", &realm, pcscf, &sa.ue_ip,
-            &nonce.unwrap_or_default(), &resp, ue_send, ue_recv,
+            &nonce_str, &resp, ue_send, ue_recv,
             sa.ue_send as u32, sa.ue_recv as u32);
         let esp = register::build_esp(sa.ue_send as u32, 1, &sa.esp_key, sip2.as_bytes());
         log::info!("secure REGISTER via ESP {} bytes to pcscf{}", esp.len(), pcscf);
