@@ -7,14 +7,18 @@ edition = "2021"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-zbus = { version = "5", default-features = false, features = ["tokio"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.29", default-features = false, features = ["ioctl", "net"] }
+hex = "0.4"
+md-5 = "0.10"
+hmac = "0.12"
+digest = "0.10"
+aes = "0.8"
+cipher = "0.4"
+base64 = "0.22"
+log = "0.4"
 
 [[bin]]
 name = "simadmin-ims"
