@@ -30,12 +30,51 @@ async fn ip(args: &[&str]) -> Result<String> {
 }
 
 pub async fn discover_pcscf() -> Result<String> {
-    let tbl = ip(&["-6", "route"]).await?;
-    tbl.lines().find_map(|l| {
-        if l.contains("dev wwan1") && l.contains("2408:8142") {
-            Some(l.split_whitespace().next().unwrap_or("").to_string())
-        } else { None }
-    }).ok_or_else(|| anyhow!("P-CSCF route via wwan1 not found"))
+    // Retry: route via wwan1 may appear only after the bearer is up.
+    for _ in 0..12 {
+        if let Ok(tbl) = ip(&["-6", "route"]).await {
+            if let Some(pc) = tbl.lines().find_map(|l| {
+                if l.contains("dev wwan1") && l.contains("2408:8142") {
+                    Some(l.split_whitespace().next().unwrap_or("").to_string())
+                } else { None }
+            }) { return Ok(pc); }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    Err(anyhow!("P-CSCF route via wwan1 not found after retry"))
+}
+
+pub async fn bearer_start(at: &str) -> bool {
+    let mut child = match Command::new("qmicli")
+        .args(["--device", &format!("/dev/wwan0{}", at),
+               "--device-open-net=net-raw-ip",
+               "--wds-start-network", "--apn=ims.epc.mnc001.mcc460.gprs"])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .spawn() {
+        Ok(c) => c, Err(_) => return false,
+    };
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let routes = ip(&["-6", "route"]).await.unwrap_or_default();
+    if routes.contains("dev wwan1") && routes.contains("2408:8142") { return true; }
+    // If qmicli hasn't spawned the bearer, kill it.
+    if child.kill().await.is_err() {}
+    let _ = child.wait().await;
+    false
+}
+
+async fn is_up() -> bool {
+    Command::new("ip").args(["-6", "addr", "show", "wwan1", "scope", "global"]).output().await
+        .map(|o| o.status.success()).unwrap_or(false)
+}
+
+async fn wait_pcscf() -> bool {
+    for _ in 0..12 {
+        if let Ok(tbl) = ip(&["-6", "route"]).await {
+            if tbl.contains("dev wwan1") && tbl.contains("2408:8142") { return true; }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    false
 }
 
 pub async fn local_ip() -> Result<String> {
@@ -87,7 +126,21 @@ impl SaParams {
         let pl = ip(&["xfrm", "policy"]).await?;
         parse_legacy(&st, &pl, pcscf, ue_ip)
     }
+    /// 优先复用已激活的 IPsec SA(1.1.6 遗留);没有则按当前 UE IP 分配新 SPI + 32 字节零 key
+    /// (真 key 由 USIM AKA 产生,后续替换占位)。
+    pub async fn from_live(pcscf: &str, ue_ip: &str) -> Result<Self> {
+        if let Ok(sa) = Self::from_legacy(pcscf, ue_ip).await {
+            if sa.esp_key.len() >= 32 { return Ok(sa); }
+        }
+        let spic = fastrand(); let spis = fastrand();
+        let ue_send: u16 = 5064; let ue_recv: u16 = 5063;
+        Ok(SaParams { ue_ip: ue_ip.to_string(), pcscf: pcscf.to_string(),
+            ue_send, ue_recv, pcscf_send: 5060, pcscf_recv: 5060, esp_key: vec![0; 32] })
+    }
 }
+
+fn fastrand() -> u32 { std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as u32 ^ 0x9e3779b9 }
 
 fn parse_legacy(state: &str, policy: &str, pcscf: &str, ue_ip: &str) -> Result<SaParams> {
     let esp_key_hex = state.lines().find_map(|l| {
