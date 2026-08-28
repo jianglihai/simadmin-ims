@@ -7,7 +7,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
 mod register;
-use register::{build_plain_register, build_esp};
+use register::{build_plain_register, build_esp, build_secure_register};
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct State {
@@ -118,25 +118,71 @@ async fn log_end(st: &Arc<Mutex<State>>, msg: &str, step: &str) {
     s.log = msg.to_string(); s.registering_step = step.to_string();
 }
 
-async fn do_register(pcscf: &str, sa: &register::SaParams, plain: &[u8]) -> Result<bool> {
+async fn do_register(pcscf: &str, sa: &register::SaParams, _plain: &[u8]) -> Result<bool> {
     let pcscf_addr: std::net::Ipv6Addr = pcscf.parse()?;
-    let u = tokio::net::UdpSocket::bind("[::]:0").await?;
-    u.send_to(plain, (pcscf_addr, 5061)).await?;
+    // 用随机 UE 端口(5064/5063 语义,先复用 xfrm 的 ue_send)
+    let u = tokio::net::UdpSocket::bind("::1:0").await
+        .or_else(|_| tokio::net::UdpSocket::bind("::1:0").await).await
+        .or_else(|_| tokio::net::UdpSocket::bind("[::]:0").await).await?;
+    let ue_local = u.local_addr().unwrap();
+    log::info!("ims udp bound {}", ue_local);
+
+    let ue_send = if sa.ue_send > 0 { sa.ue_send } else { 5064 };
+    let ue_recv = if sa.ue_recv > 0 { sa.ue_recv } else { 5063 };
+
+    // 第 1 轮:明文 REGISTER → P-CSCF 5061 (TS 24.229)
+    let sip1 = build_plain_register("ue", "ims.mnc001.mcc460.3gppnetwork.org",
+        pcscf, &sa.ue_ip, ue_send, ue_recv, 0, sa.ue_send as u32, sa.ue_recv as u32);
+    log::info!("plain REGISTER {} bytes", sip1.len());
     let mut buf = [0u8; 4096];
-    let recv = tokio::time::timeout(std::time::Duration::from_secs(15), u.recv_from(&mut buf)).await;
-    match recv {
-        Ok(Ok((n, _from))) => {
-            // 收到 401 后:做 AKAv1-MD5 + ESP 受保护 REGISTER (后续第 2 轮)
-            let sip_resp = String::from_utf8_lossy(&buf[..n]);
-            let _ = &plain[..std::cmp::min(plain.len(), 10)];
-            // 受保护 REGISTER:ESP 封装后发
-            let esp = register::build_esp(0xCAFE, 1, &sa.esp_key, plain);
-            u.send_to(&esp, (pcscf_addr, sa.pcscf_send)).await.ok();
-            Ok(sip_resp.contains("401") || sip_resp.contains("200"))
+    u.send_to(sip1.as_bytes(), (pcscf_addr, 5061)).await?;
+    let r1 = tokio::time::timeout(std::time::Duration::from_secs(12), u.recv_from(&mut buf)).await;
+    let (n, _from) = match r1 {
+        Ok(Ok(x)) => x,
+        _ => { log::info!("no 401 reply (timeout/err)"); return Ok(false); }
+    };
+    let sip_resp = String::from_utf8_lossy(&buf[..n]);
+    log::info!("resp {} bytes: {}", n, &sip_resp[..std::cmp::min(n, 80)]);
+
+    // 第 2 轮:若 401,提取 nonce/realm/Security-Server;用 USIM AKA 算 AKAv1-MD5 → 受保护 REGISTER over ESP
+    if sip_resp.contains("401") {
+        let nonce = parse_digest_field(&sip_resp, "nonce");
+        let realm = parse_digest_field(&sip_resp, "realm").unwrap_or_else(|| "ims.mnc001.mcc460.3gppnetwork.org".to_string());
+        // 用占位 RES 先跑通 ESP 路径(真 AKA 需 CHALLENGE APDU,后续接)
+        let resp = aka_md5_response(&[0;16], &[0;8], &nonce.unwrap_or_default(),
+            "00000001", "0123456789abcdef", "auth", &realm, "ue");
+        let sip2 = build_secure_register("ue", &realm, pcscf, &sa.ue_ip,
+            &nonce.unwrap_or_default(), &resp, ue_send, ue_recv,
+            sa.ue_send as u32, sa.ue_recv as u32);
+        let esp = register::build_esp(sa.ue_send as u32, 1, &sa.esp_key, sip2.as_bytes());
+        log::info!("secure REGISTER via ESP {} bytes to pcscf{}", esp.len(), pcscf);
+        u.send_to(&esp, (pcscf_addr, sa.pcscf_send)).await?;
+        let r2 = tokio::time::timeout(std::time::Duration::from_secs(12), u.recv_from(&mut buf)).await;
+        match r2 {
+            Ok(Ok((n2, _))) => {
+                let resp2 = String::from_utf8_lossy(&buf[..n2]);
+                log::info!("secure resp {} bytes: {}", n2, &resp2[..std::cmp::min(n2, 60)]);
+                Ok(resp2.contains("200 OK"))
+            }
+            _ => Ok(false),
         }
-        _ => {
-            log::debug!("recv timeout");
-            Ok(false)
+    } else {
+        Ok(sip_resp.contains("200 OK"))
+    }
+}
+
+fn parse_digest_field(s: &str, key: &str) -> Option<String> {
+    for part in s.split(|c| c == ';' || c == '\r' || c == '\n') {
+        let p = part.trim();
+        if p.contains('=') && p.starts_with(key) {
+            let v = p.splitn(2, '=').nth(1)?.trim().trim_matches('"');
+            if !v.is_empty() { return Some(v.to_string()); }
         }
     }
+    None
+}
+
+fn aka_md5_response(rand: &[u8], res: &[u8], nonce: &str, nc: &str,
+                    cnonce: &str, qop: &str, realm: &str, user: &str) -> Vec<u8> {
+    register::aka_md5_response(rand, res, nonce, nc, cnonce, qop, realm, user)
 }
