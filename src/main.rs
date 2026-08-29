@@ -1,5 +1,6 @@
 //! simadmin-ims: 独立 IMS 注册守护
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -166,7 +167,18 @@ async fn do_register(pcscf: &str, sa: &register::SaParams) -> Result<bool> {
     let sec_srv_str = String::from_utf8_lossy(&sec_srv).trim().to_string();
     eprintln!("[ims] nonce={} sec-srv={}", nonce_str,
         sec_srv_str[..std::cmp::min(sec_srv_str.len(), 80)].to_string());
-    let resp_digest = aka_md5_response(&[0;16], &[0;8], &nonce_str, "00000001",
+
+    // IMS AKA:nonce = base64(RAND || AUTN)。解出 RAND/AUTN 后交 USIM 算 RES/CK/IK。
+    let chal = base64::engine::general_purpose::STANDARD
+        .decode(nonce_str.trim().trim_matches('"'))
+        .map_err(|e| anyhow!("nonce base64 解码失败: {}", e))?;
+    if chal.len() < 32 { return Err(anyhow!("AKA 挑战长度异常: {} 字节", chal.len())); }
+    let mut rand = [0u8; 16]; let mut autn = [0u8; 16];
+    rand.copy_from_slice(&chal[..16]); autn.copy_from_slice(&chal[16..32]);
+    let (xres, _ck, _ik) = register::usim_aka(&rand, &autn).await
+        .map_err(|e| anyhow!("USIM AKA 失败(设备 QMI 未开放 AKA?): {}", e))?;
+    eprintln!("[ims] AKA ok res_len={}", xres.len());
+    let resp_digest = aka_md5_response(&rand, &xres, &nonce_str, "00000001",
         "0123456789abcdef", "auth", realm, "ue");
     let resp_hex: String = resp_digest.iter().map(|b| format!("{:02x}", b)).collect();
     let t2 = ts();
