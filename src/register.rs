@@ -35,7 +35,9 @@ pub async fn discover_pcscf() -> Result<String> {
         if let Ok(tbl) = ip(&["-6", "route"]).await {
             if let Some(pc) = tbl.lines().find_map(|l| {
                 if l.contains("dev wwan1") && l.contains("2408:8142") {
-                    Some(l.split_whitespace().next().unwrap_or("").to_string())
+                    let first = l.split_whitespace().next().unwrap_or("");
+                    // 路由首列形如 2408:8142:6001:1::/64，剥离 /64 前缀再返回纯地址
+                    Some(first.split('/').next().unwrap_or(first).to_string())
                 } else { None }
             }) { return Ok(pc); }
         }
@@ -184,14 +186,42 @@ type HmacMd5 = Hmac<md5::Md5>;
 
 pub fn aka_md5_response(rand: &[u8], res: &[u8], nonce: &str, nc: &str,
                         cnonce: &str, qop: &str, realm: &str, user: &str) -> Vec<u8> {
-    let mut d = md5::Md5::new();
-    d.update(res); d.update(nonce.as_bytes()); d.update(nc.as_bytes());
-    d.update(cnonce.as_bytes()); d.update(qop.as_bytes());
-    d.update(format!("auth:{}:{}", realm, user).as_bytes());
-    let step_a = d.finalize().to_vec();
-    let mut d2 = md5::Md5::new();
-    d2.update(rand); d2.update(&step_a);
-    d2.finalize().to_vec()
+    // RFC 4169 AKAv1-MD5: response = HEX( KD((RAND,XRES), data) )
+    //   KD(secret,data) = HMAC-MD5(secret, data)
+    //   secret = RAND || XRES
+    //   data   = nonce:nc:cnonce:qop:auth:realm:username
+    let secret: Vec<u8> = [rand, res].concat();
+    let data = format!("{}:{}:{}:{}:auth:{}:{}", nonce, nc, cnonce, qop, realm, user);
+    let mut mac = HmacMd5::new_from_slice(&secret).unwrap();
+    mac.update(data.as_bytes());
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// 经 QMI UIM AUTHENTICATE 在 USIM 上运行 IMS AKA(RAND||AUTN),返回 (RES, CK, IK)。
+/// 需要本机 qmicli 支持 --uim-authenticate(部分 libqmi 版本缺失该命令,届时返回 Err)。
+pub async fn usim_aka(rand: &[u8; 16], autn: &[u8; 16]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let chal = hex::encode([rand.as_slice(), autn.as_slice()].concat());
+    let out = qmicli(&[
+        "--device", "/dev/wwan0at2", "--device-open-qmi", "-p",
+        "--uim-authenticate",
+        &format!("3gpp,A0:00:00:00:87:10:02:FF:86:FF:FF:89:FF:FF:FF:FF,{}", chal),
+    ]).await?;
+    parse_aka_response(&out)
+}
+
+/// 解析 qmicli --uim-authenticate 输出,提取 RES/CK/IK(十六进制)。
+/// 兼容多种输出格式: 'RES = <hex>' / 'CK = <hex>' / 裸十六进制串。
+fn parse_aka_response(s: &str) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let get = |tag: &str| -> Result<Vec<u8>> {
+        let idx = s.find(tag).ok_or_else(|| anyhow!("AKA 响应缺少 {}", tag))?;
+        let after = &s[idx + tag.len()..];
+        let hex: String = after.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+        hex::decode(&hex).map_err(|e| anyhow!("AKA {} 解码失败: {}", tag, e))
+    };
+    let res = get("RES")?;
+    let ck = get("CK")?;
+    let ik = get("IK")?;
+    Ok((res, ck, ik))
 }
 
 pub fn compute_icv(key: &[u8], spi: u32, seq: u32, iv: &[u8], ct: &[u8]) -> Vec<u8> {
